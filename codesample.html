@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>George Engelbrecht.com</title>
+    <meta charset="UTF-8">
+    <link rel="icon" href="/favicon.ico?v=1.1"> 
+    <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.2.5/ace.js">
+    </script>
+    <style>
+      #editor { 
+        position: absolute;
+        top: 0;
+        right: 0;
+        bottom: 0;
+        left: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="editor">
+      
+  // Written by: George Engelbrecht
+  // Purpose: Creates a .shp file from an input raster file
+  //          using the marching squares algorithm and a
+  //          backing sqlite database.
+  // 
+  // Inputs:
+  //          string inputFilepath - path to input raster
+  //          string outputDir - path to output directory
+  //          string outputBaseName - prepend outout with this string
+  //          double[] breakpoint - raster value breakpoints for contour
+  //          string layername - name of layerfile corresponding to .shp
+  //          breakpointComparerFunction - delegate function for value compare
+  //          int[] color - desired RGB 32bit color for output layerfile
+  
+  public static string[] CreateFromRaster(
+                            string inputFilepath, 
+                            string outputDir, 
+                            string outputBaseName,
+                            double[] breakpoints, 
+                            string layerName, 
+                            LessThanOrGreaterThan breakpointComparerFunction, 
+                            int[] colors)  {
+
+      var shpPaths = new List&lt;string&gt;();
+      ShapeFile.outputDir = outputDir;
+
+      switch (breakpointComparerFunction)
+      {
+          case LessThanOrGreaterThan.LessThan:
+              breakpointComparer = LessThanComparer;
+              NO_VALUE = float.MaxValue;
+              break;
+          case LessThanOrGreaterThan.GreaterThan:
+              breakpointComparer = GreaterThanComparer;
+              NO_VALUE = float.MinValue;
+              break;
+      }
+
+      // open the GeoTIFF file to grab the data
+      var fi = new FileInfo(inputFilepath);
+      IWorkspaceFactory workspaceFactory = new RasterWorkspaceFactoryClass();
+      var rasterWorkspace = workspaceFactory.OpenFromFile(fi.DirectoryName, 0) as IRasterWorkspace;
+      var rasterDS = (IRasterDataset3)rasterWorkspace.OpenRasterDataset(fi.Name);
+      rasterBand = ((IRasterBandCollection)rasterDS).Item(0);
+      envelope = ((IRasterProps)rasterBand).Extent.Envelope;
+
+      var envLatWidth = envelope.YMax - envelope.YMin;
+      var envLongWidth = envelope.XMax - envelope.XMin;
+      var envYMax = envelope.YMax;
+      var envXMin = envelope.XMin;
+
+      spatialReference = ((IRasterProps)rasterBand).SpatialReference;
+
+      height = ((IRasterProps)rasterBand).Height;
+      width = ((IRasterProps)rasterBand).Width;
+
+      for (int i = 0; i &lt; breakpoints.Length; i++)
+      {
+          var dbPath = Path.Combine(outputDir, "lines.sqlite");
+          if (System.IO.File.Exists(dbPath))
+          {
+              System.IO.File.Delete(dbPath);
+          }
+          System.Data.SQLite.SQLiteConnection.CreateFile(dbPath);
+          SQLiteConnection dbConnection = new SQLiteConnection("Data Source=" + dbPath + ";Version=3;");
+          dbConnection.Open();
+          SQLiteCommand pragmaOff = new SQLiteCommand("PRAGMA synchronous = OFF", dbConnection);
+          pragmaOff.ExecuteNonQuery();
+          pragmaOff.Dispose();
+          SQLiteCommand memoryJournal = new SQLiteCommand("PRAGMA journal_mode = MEMORY", dbConnection);
+          memoryJournal.ExecuteNonQuery();
+          memoryJournal.Dispose();
+          SQLiteCommand createTable = new SQLiteCommand(CREATE_TABLE, dbConnection);
+          createTable.ExecuteNonQuery();
+          createTable.Dispose();
+
+          // now loop through each data row...
+          var yOffset = -1;
+          using (SQLiteTransaction mytransaction = dbConnection.BeginTransaction())
+          {
+              SQLiteCommand insertSegment = new SQLiteCommand(dbConnection);
+              insertSegment.CommandText = INSERT_SEGMENT;
+
+              foreach (var data in EnumNextDataRow())
+              {
+                  // use a sliding 2 x 2 window to process data 2 rows at a time to save memory
+                  for (var x = 0; x &lt; data.GetLength(1) - 1; x++)
+                  // -1 since we want to stop 1 short of the end for 2x2 window
+                  {
+                      var cellValue = CalculateCellValue(data[0, x], data[0, x + 1], data[1, x], data[1, x + 1],
+                          breakpoints[i]);
+                      if (cellValue == 0 || cellValue == 15) // 0 and 15 are cells with no lines (filled or empty)
+                          continue;
+
+                      foreach (var ls in LineSegment.LineFromCellType(cellValue, x, yOffset + 1))
+                      {
+                          insertSegment.Parameters.Add(new SQLiteParameter("@CANTORSTART", ls.StartCantorPairing));
+                          insertSegment.Parameters.Add(new SQLiteParameter("@CANTOREND", ls.EndCantorPairing));
+                          insertSegment.Parameters.Add(new SQLiteParameter("@STARTX", ls.Start.X));
+                          insertSegment.Parameters.Add(new SQLiteParameter("@STARTY", ls.Start.Y));
+                          insertSegment.Parameters.Add(new SQLiteParameter("@ENDX", ls.End.X));
+                          insertSegment.Parameters.Add(new SQLiteParameter("@ENDY", ls.End.Y));
+                          insertSegment.ExecuteNonQuery();
+                      }
+                  }
+                  yOffset++;
+              }
+
+              insertSegment.Dispose();
+              mytransaction.Commit();
+          }
+          long operationCount = 0;
+          // close lines to polygons
+          var activePolygon = new List&lt;LineSegment&gt;(4);
+
+          // create a shapefile and store the geometry collection in it
+          var fullLayerFileName = Regex.Replace(layerName, "[^a-zA-Z0-9_]+", "_");
+          if (breakpoints[i] &lt; 0)
+              fullLayerFileName += "_negative";
+          fullLayerFileName += "_" + Math.Abs(Math.Round(breakpoints[i], 2)) + ".shp";
+          shpPaths.Add(Path.Combine(outputDir, fullLayerFileName));
+          var shpFile = CreateShapefile(outputDir, fullLayerFileName);
+          var feature = shpFile.CreateFeature();
+
+          var geoCollection = (IGeometryCollection)new Polygon();
+          var segs = GetRowCount(ref dbConnection);
+          var totalSegs = segs;
+
+          var selectSegmentStart = new SQLiteCommand(dbConnection);
+          selectSegmentStart.CommandText = SELECT_SEGMENT_FROM_START;
+          var removeEnd = new SQLiteCommand(dbConnection);
+          removeEnd.CommandText = REMOVE_SEGMENT_WITH_START;
+              while (segs > 0)
+              {
+                  activePolygon.Clear();
+                  var segStart = GetFirstSegmentEnd(ref dbConnection);
+                  LineSegment currentSegment = GetSegmentFromStart(ref dbConnection, ref selectSegmentStart, segStart);
+                  do
+                  {
+                      currentSegment = GetSegmentFromStart(ref dbConnection, ref selectSegmentStart, currentSegment.EndCantorPairing);
+                      activePolygon.Add(currentSegment);
+                      RemoveSegmentWithStart(ref dbConnection, ref removeEnd, currentSegment.StartCantorPairing);
+                      segs -= 1;
+                  } while (activePolygon[0].StartCantorPairing != currentSegment.EndCantorPairing);
+
+                  // if the resulting polygon is too small, throw it away
+                  if (activePolygon.Count > CULLING_VALUE)
+                  {
+                      var ring = MakeRing(activePolygon, envLatWidth, envLongWidth, envXMin, envYMax);
+                      geoCollection.AddGeometry(ring);
+                      UnMarshal(ring);
+                  }
+
+                  operationCount += 1;
+                  // free space inside the dictionary once in a while
+                  if (operationCount > 1000)
+                  {
+                      feature.Shape = (IGeometry)geoCollection;
+                      feature.Store();
+                      UnMarshal(geoCollection);
+                      geoCollection = (IGeometryCollection)new Polygon();
+                      feature = shpFile.CreateFeature();
+                      operationCount = 0;
+                      GCFullCollect();
+                  }
+          }
+
+          selectSegmentStart.Dispose();
+          removeEnd.Dispose();
+          
+          feature.Shape = (IGeometry)geoCollection;
+          feature.Store();
+
+          dbConnection.Close();
+          GCFullCollect();
+          try
+          {
+              File.Delete(dbPath);
+          }
+          catch (Exception)
+          {
+              // ignored
+          }
+
+          UnMarshal(geoCollection, feature);
+
+          if (colors == null)
+              throw new Exception("There must be colors defined for contour layerfiles!");
+
+          // Create layerfile
+          Layerfile.CreateFromShapefile(Path.Combine(outputDir, fullLayerFileName), colors[i]);
+
+      } // on to the next breakpoint...
+      UnMarshal(rasterDS, rasterWorkspace, workspaceFactory, envelope, spatialReference);
+
+      return shpPaths.ToArray();
+    }
+    </div>
+    <script>
+      var editor = ace.edit("editor");
+      editor.getSession().setMode("ace/mode/coffee");
+      editor.setReadOnly(true);
+      editor.setTheme("ace/theme/monokai");
+      editor.getSession().setMode("ace/mode/csharp");
+      editor.renderer.setShowGutter(false);
+    </script>
+  </body>
+</html>
